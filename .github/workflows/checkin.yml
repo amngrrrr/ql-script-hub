@@ -1,0 +1,230 @@
+# ============================================================
+# 多平台签到 · GitHub Actions 版
+# 仓库: fork 自 agluo/ql-script-hub
+# 每天北京时间 07:30 自动运行，也可在 Actions 页面手动触发
+#
+# 使用方法:
+#   1. Settings → Secrets and variables → Actions 添加密钥
+#      (变量名见文件底部注释，配置了哪个就跑哪个平台)
+#   2. Actions 页面启用本工作流
+#   3. 手动触发测试: Actions → 多平台签到 → Run workflow
+# ============================================================
+name: 多平台签到
+
+on:
+  schedule:
+    - cron: '30 23 * * *'   # UTC 23:30 = 北京时间 07:30
+  workflow_dispatch:         # 支持手动触发
+
+permissions:
+  contents: read
+  actions: write             # 用于清理旧运行日志
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # ---------- 平台密钥（配置哪个跑哪个，其余自动跳过） ----------
+      QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}                 # 夸克网盘
+      ALIYUN_REFRESH_TOKEN: ${{ secrets.ALIYUN_REFRESH_TOKEN }} # 阿里云盘
+      TIEBA_COOKIE: ${{ secrets.TIEBA_COOKIE }}                 # 百度贴吧
+      sfsyUrl: ${{ secrets.SFSY_URL }}                          # 顺丰速运
+      BAIDU_COOKIE: ${{ secrets.BAIDU_COOKIE }}                 # 百度网盘
+      TY_USERNAME: ${{ secrets.TY_USERNAME }}                   # 天翼云盘
+      TY_PASSWORD: ${{ secrets.TY_PASSWORD }}
+      NGA_CREDENTIALS: ${{ secrets.NGA_CREDENTIALS }}           # NGA论坛
+      enshan_cookie: ${{ secrets.ENSHAN_COOKIE }}               # 恩山论坛
+      NODESEEK_COOKIE: ${{ secrets.NODESEEK_COOKIE }}           # NodeSeek
+      IKUUU_EMAIL: ${{ secrets.IKUUU_EMAIL }}                   # ikuuu
+      IKUUU_PASSWD: ${{ secrets.IKUUU_PASSWD }}
+      DEEPFLOOD_COOKIE: ${{ secrets.DEEPFLOOD_COOKIE }}         # deepflood
+      tsthbck: ${{ secrets.TSTHB_CK }}                          # 塔斯汀汉堡
+      CDRAIL_DATA: ${{ secrets.CDRAIL_DATA }}                   # 成都地铁
+      PASSNAT_SK: ${{ secrets.PASSNAT_SK }}                     # PassNAT
+      HiFiti_COOKIE: ${{ secrets.HIFITI_COOKIE }}               # HiFiTi
+      # ---------- 通知推送（可选，配了才会推） ----------
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_USER_ID: ${{ secrets.TG_USER_ID }}
+      PUSH_KEY: ${{ secrets.PUSH_KEY }}                         # Server酱
+      PUSH_PLUS_TOKEN: ${{ secrets.PUSH_PLUS_TOKEN }}
+      DD_BOT_TOKEN: ${{ secrets.DD_BOT_TOKEN }}                 # 钉钉
+      DD_BOT_SECRET: ${{ secrets.DD_BOT_SECRET }}
+      BARK_PUSH: ${{ secrets.BARK_PUSH }}                       # iOS Bark
+      # ---------- 运行参数 ----------
+      RANDOM_SIGNIN: 'false'     # Actions 上关闭随机延迟，省时间
+      MAX_RANDOM_DELAY: '600'
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install --quiet requests
+
+      - name: 生成本地辅助文件（通知模块 + 分发器）
+        run: |
+          cat > notify.py << 'PYEOF'
+          # -*- coding: utf-8 -*-
+          """极简多渠道通知: Telegram / Server酱 / PushPlus / Bark / 钉钉"""
+          import os
+          import requests
+
+          def send(title, content):
+              for fn in (_tg, _serverchan, _pushplus, _bark, _dingtalk):
+                  try:
+                      fn(title, content)
+                  except Exception as e:
+                      print(f"通知渠道 {fn.__name__} 异常: {e}")
+
+          def _tg(title, content):
+              token = os.environ.get("TG_BOT_TOKEN", "").strip()
+              uid = os.environ.get("TG_USER_ID", "").strip()
+              if not (token and uid):
+                  return
+              r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                data={"chat_id": uid, "text": f"{title}\n\n{content}"}, timeout=15)
+              print("Telegram 推送:", r.status_code)
+
+          def _serverchan(title, content):
+              key = os.environ.get("PUSH_KEY", "").strip()
+              if not key:
+                  return
+              r = requests.post(f"https://sctapi.ftqq.com/{key}.send",
+                                data={"title": title, "desp": content}, timeout=15)
+              print("Server酱 推送:", r.status_code)
+
+          def _pushplus(title, content):
+              token = os.environ.get("PUSH_PLUS_TOKEN", "").strip()
+              if not token:
+                  return
+              r = requests.post("https://www.pushplus.plus/send",
+                                json={"token": token, "title": title, "content": content}, timeout=15)
+              print("PushPlus 推送:", r.status_code)
+
+          def _bark(title, content):
+              push = os.environ.get("BARK_PUSH", "").strip()
+              if not push:
+                  return
+              if "http" not in push:
+                  push = f"https://api.day.app/{push}"
+              r = requests.get(f"{push}/{title}/{content}", timeout=15)
+              print("Bark 推送:", r.status_code)
+
+          def _dingtalk(title, content):
+              token = os.environ.get("DD_BOT_TOKEN", "").strip()
+              if not token:
+                  return
+              r = requests.post(f"https://oapi.dingtalk.com/robot/send?access_token={token}",
+                                json={"msgtype": "text", "text": {"content": f"{title}\n\n{content}"}}, timeout=15)
+              print("钉钉 推送:", r.status_code)
+          PYEOF
+
+          cat > run_all.py << 'PYEOF'
+          # -*- coding: utf-8 -*-
+          """签到分发器: 检测已配置的环境变量, 只运行对应平台脚本"""
+          import os
+          import subprocess
+          import sys
+          import time
+          import random
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+              sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+          TASKS = [
+              ("QUARK_COOKIE",          "quark_signin.py",        "夸克网盘"),
+              ("ALIYUN_REFRESH_TOKEN",  "aliyunpan_checkin.py",   "阿里云盘"),
+              ("TIEBA_COOKIE",          "tieba_checkin.py",       "百度贴吧"),
+              ("sfsyUrl",               "SFSU_checkin.py",        "顺丰速运"),
+              ("BAIDU_COOKIE",          "baiduwangpan_checkin.py","百度网盘"),
+              ("TY_USERNAME",           "ty_netdisk_checkin.py",  "天翼云盘"),
+              ("NGA_CREDENTIALS",       "nga_checkin.py",         "NGA论坛"),
+              ("enshan_cookie",         "enshan_checkin.py",      "恩山论坛"),
+              ("NODESEEK_COOKIE",       "nodeseek_checkin.py",    "NodeSeek"),
+              ("IKUUU_EMAIL",           "ikuuu_checkin.py",       "ikuuu"),
+              ("DEEPFLOOD_COOKIE",      "deepflood_checkin.py",   "deepflood"),
+              ("tsthbck",               "tsthb_checkin.py",       "塔斯汀汉堡"),
+              ("CDRAIL_DATA",           "CDRail.py",              "成都地铁"),
+              ("PASSNAT_SK",            "passnat_checkin.py",     "PassNAT"),
+              ("HiFiti_COOKIE",         "HiFiti_checkin.py",      "HiFiTi"),
+          ]
+
+          def main():
+              results = []
+              for env_name, script, label in TASKS:
+                  configured = os.environ.get(env_name, "").strip()
+                  if not configured or not os.path.exists(script):
+                      if configured and not os.path.exists(script):
+                          print(f"⚠️ {label}: 脚本 {script} 不存在(上游可能已改名), 跳过")
+                      continue
+                  print(f"\n{'=' * 50}", flush=True)
+                  print(f"▶ 开始执行: {label} ({script})", flush=True)
+                  print(f"{'=' * 50}", flush=True)
+                  t0 = time.time()
+                  rc = subprocess.call([sys.executable, script])
+                  dt = int(time.time() - t0)
+                  status = "OK" if rc == 0 else f"FAIL(rc={rc})"
+                  results.append((label, status, dt))
+                  if env_name != TASKS[-1][0]:
+                      time.sleep(random.uniform(5, 15))
+
+              print(f"\n{'=' * 50}")
+              print("📋 今日签到执行汇总")
+              print(f"{'=' * 50}")
+              has_fail = False
+              for label, status, dt in results:
+                  icon = "✅" if status == "OK" else "❌"
+                  print(f"  {icon} {label}: {status} ({dt}s)")
+                  if status != "OK":
+                      has_fail = True
+              if not results:
+                  print("  (未检测到任何已配置的平台, 请检查仓库 Secrets)")
+              print(f"共执行 {len(results)} 个平台")
+              sys.exit(1 if has_fail else 0)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      - name: 执行签到
+        run: python run_all.py
+
+      - name: 清理 7 天前的运行日志（隐私保护）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CUTOFF=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh run list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json databaseId,createdAt \
+            --jq ".[] | select(.createdAt < \"$CUTOFF\") | .databaseId" \
+          | xargs -r -n1 -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/{}"
+
+# ============================================================
+# Secrets 密钥速查（Settings → Secrets and variables → Actions）
+#   QUARK_COOKIE          夸克网盘 Cookie（多账号用 && 分隔）
+#   ALIYUN_REFRESH_TOKEN  阿里云盘 refresh_token（多账号换行）
+#   TIEBA_COOKIE          贴吧 Cookie（需含 BDUSS，多账号换行）
+#   SFSY_URL              顺丰抓包 URL
+#   BAIDU_COOKIE          百度网盘 Cookie
+#   TY_USERNAME/TY_PASSWORD 天翼云盘手机号/密码
+#   NGA_CREDENTIALS       NGA: UID,AccessToken
+#   ENSHAN_COOKIE         恩山论坛 Cookie
+#   NODESEEK_COOKIE       NodeSeek Cookie
+#   IKUUU_EMAIL/IKUUU_PASSWD  ikuuu 邮箱/密码
+#   DEEPFLOOD_COOKIE      deepflood Cookie
+#   TSTHB_CK              塔斯汀 user-token
+#   CDRAIL_DATA           成都地铁请求数据
+#   PASSNAT_SK            PassNAT 密钥
+#   HIFITI_COOKIE         HiFiTi Cookie
+#   TG_BOT_TOKEN+TG_USER_ID / PUSH_KEY / PUSH_PLUS_TOKEN /
+#   DD_BOT_TOKEN(+SECRET) / BARK_PUSH  —— 通知渠道任选其一
+# ============================================================
